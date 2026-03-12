@@ -1,0 +1,1506 @@
+#!/usr/bin/env python3
+"""
+=============================================================
+  SISTEMA DE COMANDAS — SERVIDOR LOCAL
+  Clique duplo para iniciar. Acesse pelo navegador:
+  http://localhost:8080
+=============================================================
+"""
+
+import http.server
+import socketserver
+import json
+import os
+import sys
+import uuid
+import hashlib
+import threading
+import webbrowser
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
+
+# ─── CONFIG ──────────────────────────────────────────────────
+PORT = 8080
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+# ─── HELPERS ─────────────────────────────────────────────────
+def uid(): return str(uuid.uuid4())[:12]
+def now(): return datetime.now().isoformat()
+def now_br(): return datetime.now().strftime("%d/%m/%Y %H:%M")
+def hash_pass(p): return hashlib.sha256(p.encode()).hexdigest()
+def fmt_brl(v):
+    try: return f"R$ {float(v):.2f}".replace(".", ",")
+    except: return "R$ 0,00"
+
+# In-memory cache to avoid repeated disk reads
+_cache = {}
+
+def save_json(path, data):
+    _cache[path] = data  # update cache
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, separators=(',',':'))
+
+def load_json(path, default=None):
+    if default is None: default = {}
+    if path in _cache:
+        return _cache[path]  # return from cache
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                _cache[path] = data
+                return data
+    except: pass
+    return default
+
+# ─── DATA PATHS ──────────────────────────────────────────────
+MASTER_FILE   = os.path.join(DATA_DIR, "master.json")
+PLANS_FILE    = os.path.join(DATA_DIR, "plans.json")
+TIMELINE_FILE = os.path.join(DATA_DIR, "timeline.json")
+
+def rest_dir(rid):
+    d = os.path.join(DATA_DIR, "restaurants", rid)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def rest_file(rid, name):
+    return os.path.join(rest_dir(rid), name + ".json")
+
+# ─── INIT DEFAULT DATA ───────────────────────────────────────
+def init_data():
+    if not os.path.exists(MASTER_FILE):
+        save_json(MASTER_FILE, {
+            "auth": {"user": "admin", "password": hash_pass("admin123")},
+            "settings": {"sysName": "PedidoSaaS", "contact": ""},
+            "restaurants": []
+        })
+    if not os.path.exists(PLANS_FILE):
+        save_json(PLANS_FILE, [
+            {"id": "plan1", "name": "Básico",       "price": 79.90,  "type": "mensal", "desc": "Ideal para pequenos estabelecimentos", "features": ["Sistema de Comandas","Até 3 usuários","Suporte por email"], "maxUsers": 3,  "featured": "no",  "color": "#64748b", "createdAt": now()},
+            {"id": "plan2", "name": "Profissional", "price": 149.90, "type": "mensal", "desc": "Para restaurantes em crescimento",      "features": ["Tudo do Básico","Até 10 usuários","Relatórios avançados","Suporte prioritário"], "maxUsers": 10, "featured": "yes", "color": "#6366f1", "createdAt": now()},
+            {"id": "plan3", "name": "Enterprise",   "price": 299.90, "type": "mensal", "desc": "Para redes e grandes operações",       "features": ["Usuários ilimitados","Multi-unidade","Gerente de conta","Suporte 24h"], "maxUsers": 999,"featured": "no",  "color": "#0d7c4a", "createdAt": now()},
+        ])
+    if not os.path.exists(TIMELINE_FILE):
+        save_json(TIMELINE_FILE, [])
+
+# ─── SESSION (in-memory) ─────────────────────────────────────
+sessions = {}  # token -> {type, rid, expires}
+
+def create_session(stype, rid=None):
+    token = uid() + uid()
+    sessions[token] = {"type": stype, "rid": rid, "expires": (datetime.now() + timedelta(hours=8)).isoformat()}
+    return token
+
+def get_session(token):
+    if not token or token not in sessions: return None
+    s = sessions[token]
+    if datetime.now() > datetime.fromisoformat(s["expires"]): del sessions[token]; return None
+    return s
+
+def get_token_from_req(handler):
+    cookie = handler.headers.get("Cookie", "")
+    for part in cookie.split(";"):
+        k, _, v = part.strip().partition("=")
+        if k.strip() == "session": return v.strip()
+    return None
+
+# ─── HTTP HANDLER ────────────────────────────────────────────
+class Handler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args): pass  # suppress logs
+
+    def log_error(self, fmt, *args): pass  # suppress error logs
+
+    def handle_error(self, request, client_address):
+        pass  # suppress connection errors
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass  # browser closed connection early — normal, ignore
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", len(body))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_html(self, html, status=200, extra_headers=None):
+        body = html.encode("utf-8") if isinstance(html, str) else html
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", len(body))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        if extra_headers:
+            for k, v in extra_headers.items(): self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_redirect(self, location, extra_headers=None):
+        self.send_response(302)
+        self.send_header("Location", location)
+        if extra_headers:
+            for k, v in extra_headers.items(): self.send_header(k, v)
+        self.end_headers()
+
+    def read_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length == 0: return {}
+            raw = self.rfile.read(length)
+            return json.loads(raw)
+        except: return {}
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type,Cookie")
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        token = get_token_from_req(self)
+        session = get_session(token)
+
+        # ── Static files ──
+        if path.startswith("/static/"):
+            fname = path[8:]
+            fpath = os.path.join(STATIC_DIR, fname)
+            if os.path.exists(fpath):
+                with open(fpath, "rb") as f: data = f.read()
+                self.send_response(200)
+                ct = "text/css" if fname.endswith(".css") else "text/javascript" if fname.endswith(".js") else "application/octet-stream"
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", len(data))
+                self.end_headers()
+                self.wfile.write(data)
+            else: self.send_json({"error": "not found"}, 404)
+            return
+
+        # ── Master panel ──
+        if path == "/" or path == "/master":
+            if not session or session["type"] != "master":
+                self.send_html(render_master_login())
+            else:
+                self.send_html(render_master_panel())
+            return
+
+        # ── Restaurant app ──
+        if path.startswith("/r/"):
+            rid = path[3:]
+            master = load_json(MASTER_FILE)
+            rest = next((r for r in master["restaurants"] if r["id"] == rid), None)
+            if not rest:
+                self.send_html("<h2>Restaurante não encontrado.</h2>", 404)
+                return
+            if rest.get("status") in ("suspended", "cancelled"):
+                self.send_html(render_suspended(rest))
+                return
+            # Check restaurant session
+            rsess = get_session(token)
+            if not rsess or rsess["type"] != "restaurant" or rsess["rid"] != rid:
+                self.send_html(render_restaurant_login(rest, rid))
+            else:
+                self.send_html(render_restaurant_app(rest, rid))
+            return
+
+        # ── PWA: manifest ──
+        if path.endswith("/manifest.json") and path.startswith("/r/"):
+            rid = path[3:].replace("/manifest.json","")
+            master = load_json(MASTER_FILE)
+            rest = next((r for r in master["restaurants"] if r["id"] == rid), None)
+            if not rest: self.send_json({"error":"not found"},404); return
+            cfg = load_json(rest_file(rid, "config"), {})
+            name = cfg.get("name", rest.get("name","Restaurante"))
+            color = cfg.get("color","#2563eb")
+            manifest = json.dumps({
+                "name": name, "short_name": name[:12],
+                "start_url": "/r/"+rid, "display": "standalone",
+                "background_color": "#f4f6fb", "theme_color": color,
+                "orientation": "portrait",
+                "icons": [{"src":"/r/"+rid+"/icon.png","sizes":"192x192","type":"image/png"},
+                           {"src":"/r/"+rid+"/icon.png","sizes":"512x512","type":"image/png"}]
+            }, ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/manifest+json")
+            self.send_header("Content-Length",len(manifest))
+            self.end_headers(); self.wfile.write(manifest)
+            return
+
+        # ── PWA: service worker ──
+        if path.endswith("/sw.js") and path.startswith("/r/"):
+            rid = path[3:].replace("/sw.js","")
+            sw_lines = [
+                "const CACHE='cmd-"+rid+"-v4';",
+                "const APP_URL='/r/"+rid+"';",
+                "const QUEUE_KEY='offline_queue_"+rid+"';",
+                "",
+                "// Install: cache the app shell",
+                "self.addEventListener('install',e=>{",
+                "  e.waitUntil(caches.open(CACHE).then(c=>c.add(APP_URL)));",
+                "  self.skipWaiting();",
+                "});",
+                "",
+                "// Activate: clean old caches",
+                "self.addEventListener('activate',e=>{",
+                "  e.waitUntil(caches.keys().then(keys=>Promise.all(",
+                "    keys.filter(k=>k!==CACHE).map(k=>caches.delete(k))",
+                "  )));",
+                "  self.clients.claim();",
+                "});",
+                "",
+                "// Fetch: network first, fallback to cache for GET",
+                "self.addEventListener('fetch',e=>{",
+                "  const req=e.request;",
+                "  if(req.method==='GET'){",
+                "    if(req.url.includes('/api/')) return; // never cache API GETs",
+                "    e.respondWith(",
+                "      fetch(req).then(res=>{",
+                "        const clone=res.clone();",
+                "        caches.open(CACHE).then(c=>c.put(req,clone));",
+                "        return res;",
+                "      }).catch(()=>caches.match(req).then(r=>r||caches.match(APP_URL)))",
+                "    );",
+                "    return;",
+                "  }",
+                "  // POST: try network, queue if offline",
+                "  if(req.method==='POST' && req.url.includes('/api/')){",
+                "    e.respondWith(",
+                "      req.clone().json().then(body=>{",
+                "        return fetch(req).catch(()=>{",
+                "          // Store in queue for later sync",
+                "          return self.registration.sync ? ",
+                "            getQueue().then(q=>{",
+                "              q.push({url:req.url,body,at:Date.now()});",
+                "              return setQueue(q);",
+                "            }).then(()=>new Response(JSON.stringify({ok:true,offline:true}),{headers:{'Content-Type':'application/json'}})) :",
+                "            new Response(JSON.stringify({error:'offline'}),{status:503,headers:{'Content-Type':'application/json'}});",
+                "        });",
+                "      }).catch(()=>fetch(req))",
+                "    );",
+                "    return;",
+                "  }",
+                "});",
+                "",
+                "// Background sync",
+                "self.addEventListener('sync',e=>{",
+                "  if(e.tag==='flush-queue'){",
+                "    e.waitUntil(flushQueue());",
+                "  }",
+                "});",
+                "",
+                "function getQueue(){",
+                "  return caches.open('q-"+rid+"').then(c=>c.match('/queue')).then(r=>r?r.json():[]).catch(()=>[]);",
+                "}",
+                "function setQueue(q){",
+                "  return caches.open('q-"+rid+"').then(c=>c.put('/queue',new Response(JSON.stringify(q),{headers:{'Content-Type':'application/json'}})));",
+                "}",
+                "async function flushQueue(){",
+                "  const q=await getQueue();",
+                "  if(!q.length)return;",
+                "  const failed=[];",
+                "  for(const item of q){",
+                "    try{",
+                "      await fetch(item.url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(item.body),credentials:'include'});",
+                "    }catch(e){failed.push(item);}",
+                "  }",
+                "  await setQueue(failed);",
+                "  // Notify clients",
+                "  const clients=await self.clients.matchAll();",
+                "  clients.forEach(c=>c.postMessage({type:'SYNC_DONE',pending:failed.length}));",
+                "}"
+            ]
+            sw_code = "\n".join(sw_lines).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/javascript")
+            self.send_header("Content-Length",len(sw_code))
+            self.end_headers(); self.wfile.write(sw_code)
+            return
+
+        # ── PWA: icon ──
+        if path.endswith("/icon.png") and path.startswith("/r/"):
+            rid = path[3:].replace("/icon.png","")
+            cfg = load_json(rest_file(rid, "config"), {})
+            color = cfg.get("color","#2563eb")
+            import struct, zlib
+            def make_png(color_hex, size=192):
+                try:
+                    r2=int(color_hex[1:3],16); g2=int(color_hex[3:5],16); b2=int(color_hex[5:7],16)
+                except: r2,g2,b2=37,99,235
+                raw=b''
+                for y in range(size):
+                    raw+=b'\x00'
+                    for x in range(size):
+                        m=size//6
+                        if m<x<size-m and m<y<size-m: raw+=bytes([255,255,255])
+                        else: raw+=bytes([r2,g2,b2])
+                def chunk(name,data):
+                    c=zlib.crc32(name+data)&0xffffffff
+                    return struct.pack('>I',len(data))+name+data+struct.pack('>I',c)
+                ihdr=struct.pack('>IIBBBBB',size,size,8,2,0,0,0)
+                idat=zlib.compress(raw)
+                return b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',ihdr)+chunk(b'IDAT',idat)+chunk(b'IEND',b'')
+            icon=make_png(color if (color.startswith("#") and len(color)==7) else "#2563eb")
+            self.send_response(200)
+            self.send_header("Content-Type","image/png")
+            self.send_header("Content-Length",len(icon))
+            self.end_headers(); self.wfile.write(icon)
+            return
+
+        # ── API ──
+        if path.startswith("/api/"):
+            self.handle_api_get(path, parsed, session, token)
+            return
+
+        self.send_html("<h2>404 — Página não encontrada</h2>", 404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        token = get_token_from_req(self)
+        session = get_session(token)
+        body = self.read_body()
+        self.handle_api_post(path, body, session, token)
+
+    # ── API GET ──────────────────────────────────────────────
+    def handle_api_get(self, path, parsed, session, token):
+
+        # Master: get all restaurants
+        if path == "/api/master/restaurants":
+            if not session or session["type"] != "master": self.send_json({"error":"auth"},401); return
+            master = load_json(MASTER_FILE)
+            plans = load_json(PLANS_FILE, [])
+            rests = master.get("restaurants", [])
+            # Enrich with plan name and stats
+            for r in rests:
+                plan = next((p for p in plans if p["id"] == r.get("planId","")), None)
+                r["planName"] = plan["name"] if plan else "—"
+                r["planPrice"] = plan["price"] if plan else 0
+                # Count comandas
+                cfg = load_json(rest_file(r["id"], "config"), {})
+                comandas = load_json(rest_file(r["id"], "comandas"), [])
+                r["totalComandas"] = len(comandas)
+                r["openComandas"] = len([c for c in comandas if c.get("status") != "closed"])
+            self.send_json({"restaurants": rests, "total": len(rests)})
+            return
+
+        if path == "/api/master/plans":
+            if not session or session["type"] != "master": self.send_json({"error":"auth"},401); return
+            self.send_json({"plans": load_json(PLANS_FILE, [])})
+            return
+
+        if path == "/api/master/timeline":
+            if not session or session["type"] != "master": self.send_json({"error":"auth"},401); return
+            tl = load_json(TIMELINE_FILE, [])
+            self.send_json({"timeline": tl[-50:][::-1]})
+            return
+
+        if path == "/api/master/stats":
+            if not session or session["type"] != "master": self.send_json({"error":"auth"},401); return
+            master = load_json(MASTER_FILE)
+            plans = load_json(PLANS_FILE, [])
+            rests = master.get("restaurants", [])
+            active = [r for r in rests if r.get("status") == "active"]
+            mrr = sum(next((p["price"] for p in plans if p["id"] == r.get("planId","")), 0) for r in active)
+            self.send_json({
+                "total": len(rests), "active": len(active),
+                "trial": len([r for r in rests if r.get("status") == "trial"]),
+                "suspended": len([r for r in rests if r.get("status") == "suspended"]),
+                "cancelled": len([r for r in rests if r.get("status") == "cancelled"]),
+                "mrr": mrr
+            })
+            return
+
+        # Restaurant: get data
+        if path.startswith("/api/rest/"):
+            parts = path[10:].split("/")
+            if not parts: self.send_json({"error":"invalid"},400); return
+            rid = parts[0]
+            if not session or session["type"] != "restaurant" or session["rid"] != rid:
+                self.send_json({"error":"auth"},401); return
+            resource = parts[1] if len(parts) > 1 else "config"
+
+            if resource == "config":
+                self.send_json(load_json(rest_file(rid, "config"), {}))
+            elif resource == "categories":
+                self.send_json({"categories": load_json(rest_file(rid, "categories"), [])})
+            elif resource == "products":
+                self.send_json({"products": load_json(rest_file(rid, "products"), [])})
+            elif resource == "users":
+                users = load_json(rest_file(rid, "users"), [])
+                for u in users: u.pop("password", None)
+                self.send_json({"users": users})
+            elif resource == "comandas":
+                self.send_json({"comandas": load_json(rest_file(rid, "comandas"), [])})
+            elif resource == "transactions":
+                self.send_json({"transactions": load_json(rest_file(rid, "transactions"), [])})
+            elif resource == "historico":
+                self.send_json({"historico": load_json(rest_file(rid, "historico"), [])})
+            elif resource == "mesas":
+                self.send_json({"mesas": load_json(rest_file(rid, "mesas"), [])})
+            elif resource == "estoque":
+                self.send_json({"estoque": load_json(rest_file(rid, "estoque"), {})})
+            elif resource == "movimentacoes":
+                self.send_json({"movimentacoes": load_json(rest_file(rid, "movimentacoes"), [])})
+            else:
+                self.send_json({"error":"unknown resource"},404)
+            return
+
+        self.send_json({"error":"not found"},404)
+
+    # ── API POST ─────────────────────────────────────────────
+    def handle_api_post(self, path, body, session, token):
+
+        # ── AUTH ──
+        if path == "/api/master/login":
+            master = load_json(MASTER_FILE)
+            auth = master.get("auth", {})
+            if body.get("user") == auth.get("user") and hash_pass(body.get("password","")) == auth.get("password",""):
+                tok = create_session("master")
+                add_timeline("🔐 Login master realizado", "#6366f1")
+                body_bytes = json.dumps({"ok": True}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", len(body_bytes))
+                self.send_header("Set-Cookie", f"session={tok}; Path=/; HttpOnly; SameSite=Lax")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body_bytes)
+            else:
+                self.send_json({"error":"Usuário ou senha incorretos"}, 401)
+            return
+
+        if path == "/api/master/logout":
+            if token and token in sessions: del sessions[token]
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Set-Cookie","session=; Path=/; Max-Age=0")
+            body_bytes = json.dumps({"ok":True}).encode()
+            self.send_header("Content-Length", len(body_bytes))
+            self.end_headers()
+            self.wfile.write(body_bytes)
+            return
+
+        if path.startswith("/api/rest/") and path.endswith("/logout"):
+            # Clear session cookie and invalidate session
+            if token and token in sessions:
+                del sessions[token]
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Set-Cookie","session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+            resp = b'{"ok":true}'
+            self.send_header("Content-Length",len(resp))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
+        if path.startswith("/api/rest/") and path.endswith("/login"):
+            rid = path[10:].replace("/login","")
+            master = load_json(MASTER_FILE)
+            rest = next((r for r in master["restaurants"] if r["id"] == rid), None)
+            if not rest: self.send_json({"error":"not found"},404); return
+            users = load_json(rest_file(rid, "users"), [])
+            user = next((u for u in users if u["id"] == body.get("userId","") and u["password"] == body.get("password","")), None)
+            if user:
+                tok = create_session("restaurant", rid)
+                self.send_response(200)
+                self.send_header("Content-Type","application/json")
+                self.send_header("Set-Cookie",f"session={tok}; Path=/; HttpOnly; SameSite=Lax")
+                resp = json.dumps({"ok":True,"user":{"id":user["id"],"name":user["name"],"role":user["role"],"color":user.get("color","#6366f1")}}).encode()
+                self.send_header("Content-Length",len(resp))
+                self.end_headers()
+                self.wfile.write(resp)
+            else:
+                self.send_json({"error":"Senha incorreta"},401)
+            return
+
+        # ── MASTER: manage restaurants ──
+        if path == "/api/master/restaurants":
+            if not session or session["type"] != "master": self.send_json({"error":"auth"},401); return
+            master = load_json(MASTER_FILE)
+            r = body
+            r["id"] = uid()
+            r["createdAt"] = now()
+            if not r.get("name"): self.send_json({"error":"Nome obrigatório"},400); return
+            master["restaurants"].append(r)
+            save_json(MASTER_FILE, master)
+            # Init restaurant data
+            init_restaurant(r["id"], r)
+            add_timeline(f"🏪 {r['name']} cadastrado", "#16a34a")
+            self.send_json({"ok":True, "id": r["id"]})
+            return
+
+        if path.startswith("/api/master/restaurants/"):
+            if not session or session["type"] != "master": self.send_json({"error":"auth"},401); return
+            rid = path[len("/api/master/restaurants/"):]
+            action = ""
+            if "/" in rid: rid, _, action = rid.partition("/")
+            master = load_json(MASTER_FILE)
+            idx = next((i for i,r in enumerate(master["restaurants"]) if r["id"]==rid), None)
+            if idx is None: self.send_json({"error":"not found"},404); return
+            r = master["restaurants"][idx]
+
+            if action == "delete":
+                name = r["name"]
+                master["restaurants"].pop(idx)
+                save_json(MASTER_FILE, master)
+                add_timeline(f"🗑 {name} removido", "#dc2626")
+                self.send_json({"ok":True})
+            elif action == "status":
+                new_status = body.get("status")
+                r["status"] = new_status
+                r["updatedAt"] = now()
+                master["restaurants"][idx] = r
+                save_json(MASTER_FILE, master)
+                msgs = {"active":"✅","suspended":"⏸","cancelled":"❌","trial":"🔁"}
+                add_timeline(f"{msgs.get(new_status,'•')} {r['name']} → {new_status}", "#6366f1")
+                self.send_json({"ok":True})
+            else:
+                # Update
+                for k,v in body.items():
+                    if k not in ("id","createdAt"): r[k] = v
+                r["updatedAt"] = now()
+                master["restaurants"][idx] = r
+                save_json(MASTER_FILE, master)
+                add_timeline(f"✏️ {r['name']} atualizado", "#d97706")
+                self.send_json({"ok":True})
+            return
+
+        # ── MASTER: plans ──
+        if path == "/api/master/plans":
+            if not session or session["type"] != "master": self.send_json({"error":"auth"},401); return
+            plans = load_json(PLANS_FILE, [])
+            body["id"] = uid()
+            body["createdAt"] = now()
+            plans.append(body)
+            save_json(PLANS_FILE, plans)
+            self.send_json({"ok":True})
+            return
+
+        if path.startswith("/api/master/plans/"):
+            if not session or session["type"] != "master": self.send_json({"error":"auth"},401); return
+            pid = path[len("/api/master/plans/"):]
+            action = ""
+            if "/" in pid: pid, _, action = pid.partition("/")
+            plans = load_json(PLANS_FILE, [])
+            idx = next((i for i,p in enumerate(plans) if p["id"]==pid), None)
+            if idx is None: self.send_json({"error":"not found"},404); return
+            if action == "delete":
+                plans.pop(idx); save_json(PLANS_FILE, plans); self.send_json({"ok":True})
+            else:
+                for k,v in body.items():
+                    if k not in ("id","createdAt"): plans[idx][k] = v
+                save_json(PLANS_FILE, plans); self.send_json({"ok":True})
+            return
+
+        # ── MASTER: settings ──
+        if path == "/api/master/settings":
+            if not session or session["type"] != "master": self.send_json({"error":"auth"},401); return
+            master = load_json(MASTER_FILE)
+            if "newPassword" in body:
+                master["auth"]["password"] = hash_pass(body["newPassword"])
+            if "settings" in body:
+                master["settings"].update(body["settings"])
+            save_json(MASTER_FILE, master)
+            self.send_json({"ok":True})
+            return
+
+        # ── RESTAURANT: save data ──
+        if path.startswith("/api/rest/"):
+            parts = path[10:].split("/")
+            if len(parts) < 2: self.send_json({"error":"invalid"},400); return
+            rid = parts[0]; resource = parts[1]
+            if not session or session["type"] != "restaurant" or session["rid"] != rid:
+                self.send_json({"error":"auth"},401); return
+
+            if resource == "config":
+                save_json(rest_file(rid, "config"), body)
+                self.send_json({"ok":True})
+            elif resource in ("categories","products","comandas","transactions","historico","mesas","estoque","movimentacoes"):
+                data = body.get(resource, body)
+                if data is None: self.send_json({"error":"no data"},400); return
+                save_json(rest_file(rid, resource), data)
+                self.send_json({"ok":True})
+            elif resource == "users":
+                # Don't expose raw passwords — hash them on save
+                users = body.get("users", body)
+                save_json(rest_file(rid, "users"), users)
+                self.send_json({"ok":True})
+            else:
+                self.send_json({"error":"unknown"},404)
+            return
+
+        self.send_json({"error":"not found"},404)
+
+
+# ─── RESTAURANT INIT ─────────────────────────────────────────
+def init_restaurant(rid, rest_data):
+    """Create default data files for a new restaurant - only if not exist"""
+    # Config - only create if missing
+    if not os.path.exists(rest_file(rid, "config")):
+        cfg = {"name": rest_data.get("name","Restaurante"), "slogan": "", "logo": None, "color": "#2563eb", "configured": False}
+        save_json(rest_file(rid, "config"), cfg)
+    # Data files - only create if missing
+    for resource in ("categories", "products", "comandas", "transactions"):
+        if not os.path.exists(rest_file(rid, resource)):
+            save_json(rest_file(rid, resource), [])
+    # Users - only create if missing
+    if not os.path.exists(rest_file(rid, "users")):
+        admin_pass = rest_data.get("adminPass", "1234")
+        users = [{"id": "adm1", "name": "Administrador", "role": "admin", "password": admin_pass, "color": rest_data.get("planColor", "#2563eb"), "createdAt": now()}]
+        save_json(rest_file(rid, "users"), users)
+
+def add_timeline(msg, color="#6366f1"):
+    tl = load_json(TIMELINE_FILE, [])
+    tl.append({"id": uid(), "msg": msg, "color": color, "at": now()})
+    if len(tl) > 200: tl = tl[-200:]
+    save_json(TIMELINE_FILE, tl)
+
+
+# ─── HTML RENDERS ────────────────────────────────────────────
+def render_master_login():
+    return """<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>PedidoSaaS — Login Master</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,#0f172a 0%,#1e1b4b 50%,#312e81 100%);padding:20px}
+.box{background:#fff;border-radius:20px;padding:40px 36px;width:100%;max-width:400px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.brand{text-align:center;margin-bottom:32px}
+.brand h1{font-size:1.6rem;font-weight:800;background:linear-gradient(135deg,#6366f1,#8b5cf6);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.brand p{font-size:.85rem;color:#64748b;margin-top:4px}
+label{display:block;font-size:.81rem;font-weight:600;color:#64748b;margin-bottom:6px}
+input{width:100%;padding:13px 15px;border:2px solid #e2e8f0;border-radius:8px;font-size:.95rem;margin-bottom:16px;font-family:inherit;transition:border .2s}
+input:focus{outline:none;border-color:#6366f1}
+button{width:100%;padding:14px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:8px;
+  font-size:1rem;font-weight:700;cursor:pointer;font-family:inherit;transition:opacity .2s}
+button:hover{opacity:.9}
+.err{background:#fee2e2;color:#dc2626;padding:10px 14px;border-radius:8px;font-size:.85rem;margin-bottom:14px;display:none}
+.hint{font-size:.75rem;color:#94a3b8;text-align:center;margin-top:14px}
+</style></head><body>
+<div class="box">
+  <div class="brand">
+    <div style="font-size:2.8rem;margin-bottom:8px">🏢</div>
+    <h1>PedidoSaaS</h1>
+    <p>Painel Master de Gerenciamento</p>
+  </div>
+  <div id="err" class="err"></div>
+  <label>Usuário</label>
+  <input type="text" id="u" value="admin" onkeydown="if(event.key==='Enter')document.getElementById('p').focus()"/>
+  <label>Senha</label>
+  <input type="password" id="p" placeholder="••••••••" onkeydown="if(event.key==='Enter')login()"/>
+  <button onclick="login()">Entrar no Painel 🔐</button>
+  <p class="hint">Acesso restrito ao proprietário do sistema</p>
+</div>
+<script>
+async function login(){
+  const u=document.getElementById('u').value.trim();
+  const p=document.getElementById('p').value;
+  const r=await fetch('/api/master/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,password:p}),credentials:'include'});
+  const d=await r.json();
+  if(d.ok) location.reload();
+  else{const e=document.getElementById('err');e.textContent=d.error;e.style.display='block';}
+}
+</script></body></html>"""
+
+
+def render_master_panel():
+    return """<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>PedidoSaaS — Painel Master</title>
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+:root{--p:#6366f1;--pd:#4f46e5;--pl:#eef2ff;--s:#16a34a;--sl:#dcfce7;--w:#d97706;--wl:#fef3c7;--d:#dc2626;--dl:#fee2e2;
+  --bg:#f8fafc;--wh:#fff;--tx:#0f172a;--mu:#64748b;--br:#e2e8f0;--sh:0 2px 16px rgba(0,0,0,.09);--r:12px;--rs:8px}
+html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx)}
+button{cursor:pointer;border:none;font-family:inherit}input,select,textarea{font-family:inherit}
+/* TOAST */
+#toast{position:fixed;top:18px;right:18px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{padding:11px 16px;border-radius:var(--rs);font-size:.87rem;font-weight:500;box-shadow:var(--sh);animation:tin .3s ease;max-width:300px;pointer-events:auto}
+.ts{background:#16a34a;color:#fff}.te{background:#dc2626;color:#fff}.ti{background:#6366f1;color:#fff}
+@keyframes tin{from{opacity:0;transform:translateX(100%)}to{opacity:1;transform:translateX(0)}}
+/* LAYOUT */
+.layout{display:flex;min-height:100vh}
+.sidebar{width:230px;background:#0f172a;color:#fff;display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:50}
+.sb-brand{padding:22px 18px 18px;border-bottom:1px solid rgba(255,255,255,.08)}
+.sb-brand h2{font-size:.95rem;font-weight:800}.sb-brand p{font-size:.7rem;color:rgba(255,255,255,.4);margin-top:2px}
+.sb-nav{flex:1;padding:14px 10px;display:flex;flex-direction:column;gap:2px;overflow-y:auto}
+.ni{display:flex;align-items:center;gap:9px;padding:9px 11px;border-radius:var(--rs);color:rgba(255,255,255,.6);
+  font-size:.83rem;font-weight:500;cursor:pointer;transition:all .2s;border:none;background:none;width:100%;text-align:left}
+.ni:hover{background:rgba(255,255,255,.07);color:#fff}.ni.active{background:var(--p);color:#fff}
+.ni .ic{font-size:1.05rem;flex-shrink:0}
+.nb{margin-left:auto;background:var(--d);color:#fff;padding:1px 7px;border-radius:20px;font-size:.68rem;font-weight:700}
+.sb-foot{padding:14px;border-top:1px solid rgba(255,255,255,.08);display:flex;align-items:center;gap:9px}
+.sb-av{width:32px;height:32px;border-radius:50%;background:var(--p);display:flex;align-items:center;justify-content:center;font-size:.85rem;font-weight:700;flex-shrink:0}
+.sb-info{flex:1}.sb-info strong{display:block;font-size:.8rem}.sb-info span{font-size:.7rem;color:rgba(255,255,255,.4)}
+.btn-out{background:rgba(255,255,255,.08);color:rgba(255,255,255,.6);padding:5px 9px;border-radius:6px;font-size:.77rem;cursor:pointer;border:none;transition:all .2s}
+.btn-out:hover{background:rgba(255,255,255,.15);color:#fff}
+.main{margin-left:230px;flex:1;display:flex;flex-direction:column;min-height:100vh}
+.topbar{background:#fff;border-bottom:1px solid var(--br);padding:0 24px;height:58px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:40;box-shadow:0 1px 4px rgba(0,0,0,.04)}
+.topbar h1{font-size:1.05rem;font-weight:700}
+.tb-r{display:flex;align-items:center;gap:12px}
+.tb-stat{font-size:.78rem;color:var(--mu)}
+.tb-stat strong{color:var(--tx);font-size:.88rem}
+.content{flex:1;padding:22px 24px}
+/* PANELS */
+.panel{display:none}.panel.active{display:block}
+/* BTNS */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:8px 15px;border-radius:var(--rs);font-size:.83rem;font-weight:600;transition:all .2s;cursor:pointer;border:none}
+.bp{background:var(--p);color:#fff}.bp:hover{background:var(--pd)}
+.bs{background:var(--s);color:#fff}.bw{background:var(--w);color:#fff}.bd{background:var(--d);color:#fff}
+.bg{background:#f1f5f9;color:var(--tx);border:1px solid var(--br)}.bg:hover{background:#e2e8f0}
+.bsm{padding:5px 10px;font-size:.76rem}.blg{padding:12px 20px;font-size:.93rem}
+/* CARDS */
+.card{background:#wh;background:#fff;border-radius:var(--r);padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.06);border:1px solid var(--br)}
+/* STATS */
+.sr{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}
+.sc{background:#fff;border-radius:var(--r);padding:18px;border:1px solid var(--br)}
+.sc .si{font-size:1.7rem;margin-bottom:7px;display:block}
+.sc .sv{font-size:1.7rem;font-weight:800;line-height:1}
+.sc .sl{font-size:.76rem;color:var(--mu);margin-top:3px}
+/* TABLE */
+.tw{overflow-x:auto;border-radius:var(--r);border:1px solid var(--br)}
+table{width:100%;border-collapse:collapse;background:#fff}
+thead{background:#f8fafc}
+th{padding:11px 14px;text-align:left;font-size:.76rem;font-weight:700;color:var(--mu);text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--br)}
+td{padding:12px 14px;font-size:.84rem;border-bottom:1px solid #f1f5f9;vertical-align:middle}
+tr:last-child td{border-bottom:none}tr:hover td{background:#fafbfc}
+.tda{display:flex;gap:5px;align-items:center}
+/* BADGE */
+.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:20px;font-size:.7rem;font-weight:700}
+.ba{background:var(--sl);color:var(--s)}.bsu{background:var(--wl);color:var(--w)}
+.bca{background:var(--dl);color:var(--d)}.btr{background:var(--pl);color:var(--p)}.bpl{background:#f1f5f9;color:#475569}
+/* MODAL */
+.mo{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:200;display:none;align-items:center;justify-content:center;padding:18px}
+.mo.active{display:flex}
+.modal{background:#fff;border-radius:16px;width:100%;max-width:520px;padding:26px;max-height:92vh;overflow-y:auto;animation:min .3s ease;box-shadow:0 20px 60px rgba(0,0,0,.2)}
+@keyframes min{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:scale(1)}}
+.mh{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+.mh h3{font-size:1.05rem;font-weight:700}
+.mc{background:#f1f5f9;border:none;width:28px;height:28px;border-radius:50%;font-size:.95rem;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.fg{margin-bottom:13px}
+.fg label{display:block;font-size:.79rem;font-weight:600;color:var(--mu);margin-bottom:5px}
+.fg input,.fg select,.fg textarea{width:100%;padding:10px 12px;border:2px solid var(--br);border-radius:var(--rs);font-size:.91rem;transition:border .2s;background:#fafafa}
+.fg input:focus,.fg select:focus{outline:none;border-color:var(--p)}
+.fg textarea{resize:vertical;min-height:72px}
+.fr2{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.mf{display:flex;gap:9px;margin-top:18px;justify-content:flex-end}
+/* PLANS GRID */
+.pg{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px}
+.pc{background:#fff;border-radius:var(--r);padding:18px;border:2px solid var(--br);position:relative;transition:all .2s}
+.pc:hover{border-color:var(--p);transform:translateY(-2px);box-shadow:var(--sh)}
+.pc.feat{border-color:var(--p);background:var(--pl)}
+.pba{position:absolute;top:-10px;left:50%;transform:translateX(-50%);background:var(--p);color:#fff;padding:2px 11px;border-radius:20px;font-size:.68rem;font-weight:700;white-space:nowrap}
+.pn{font-size:1.05rem;font-weight:800;margin-bottom:3px}
+.ppr{font-size:1.9rem;font-weight:800;color:var(--p);line-height:1}
+.ppr span{font-size:.85rem;font-weight:400;color:var(--mu)}
+.pd{font-size:.8rem;color:var(--mu);margin:9px 0;line-height:1.5}
+/* DETAIL SHEET */
+.ds{position:fixed;top:0;right:-420px;width:420px;height:100vh;background:#fff;z-index:100;
+  box-shadow:-4px 0 30px rgba(0,0,0,.12);transition:right .35s;overflow-y:auto;display:flex;flex-direction:column}
+.ds.open{right:0}
+.dsh{padding:20px 18px 16px;border-bottom:1px solid var(--br);display:flex;align-items:flex-start;gap:11px}
+.dsc{background:#f1f5f9;border:none;width:30px;height:30px;border-radius:50%;cursor:pointer;font-size:.95rem;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.dsb{flex:1;padding:18px}
+.dss{margin-bottom:18px}
+.dss h4{font-size:.76rem;font-weight:700;color:var(--mu);text-transform:uppercase;letter-spacing:.05em;margin-bottom:9px}
+.dsr{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f8fafc;font-size:.85rem}
+.dsr .dk{color:var(--mu)}.dsr .dv{font-weight:600}
+.dsa{padding:14px 18px;border-top:1px solid var(--br);display:flex;flex-direction:column;gap:7px}
+.dsa .btn{width:100%;justify-content:flex-start}
+/* OVERLAY */
+#dsov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:99;pointer-events:none}
+#dsov.active{pointer-events:auto}
+/* SEARCH */
+.sb2{display:flex;gap:9px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+.sb2 input{padding:8px 13px;border:2px solid var(--br);border-radius:var(--rs);font-size:.85rem;min-width:210px;transition:border .2s}
+.sb2 input:focus{outline:none;border-color:var(--p)}
+.sb2 select{padding:8px 11px;border:2px solid var(--br);border-radius:var(--rs);font-size:.85rem}
+/* TL */
+.tl{display:flex;flex-direction:column;gap:0}
+.tli{display:flex;gap:11px;padding:9px 0;border-bottom:1px solid #f1f5f9}
+.tld{width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:5px}
+.tlm{font-size:.82rem;font-weight:500}.tlt{font-size:.71rem;color:var(--mu);margin-top:1px}
+/* EMPTY */
+.empty{text-align:center;padding:44px 18px;color:var(--mu)}
+.empty .icon{font-size:2.7rem;display:block;margin-bottom:9px}
+.empty p{font-size:.87rem}
+@media(max-width:900px){.sidebar{display:none}.main{margin-left:0}.sr{grid-template-columns:repeat(2,1fr)}}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:4px}
+</style></head><body>
+<div id="toast"></div>
+<div id="dsov" onclick="closeDS()"></div>
+
+<!-- APP -->
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-brand">
+      <div style="font-size:1.5rem;margin-bottom:5px">🏢</div>
+      <h2>PedidoSaaS</h2><p>Painel Master</p>
+    </div>
+    <nav class="sb-nav">
+      <button class="ni active" data-p="dashboard" onclick="SP('dashboard',this)"><span class="ic">📊</span>Dashboard</button>
+      <button class="ni" data-p="restaurants" onclick="SP('restaurants',this)"><span class="ic">🏪</span>Restaurantes<span class="nb" id="nb">0</span></button>
+      <button class="ni" data-p="plans" onclick="SP('plans',this)"><span class="ic">📦</span>Planos & Preços</button>
+      <button class="ni" data-p="finance" onclick="SP('finance',this)"><span class="ic">💰</span>Financeiro</button>
+      <button class="ni" data-p="settings" onclick="SP('settings',this)"><span class="ic">⚙️</span>Configurações</button>
+    </nav>
+    <div class="sb-foot">
+      <div class="sb-av">M</div>
+      <div class="sb-info"><strong>Master Admin</strong><span>Proprietário</span></div>
+      <button class="btn-out" onclick="logout()">Sair</button>
+    </div>
+  </aside>
+  <main class="main">
+    <div class="topbar">
+      <h1 id="tb-title">Dashboard</h1>
+      <div class="tb-r">
+        <div class="tb-stat">MRR <strong id="tb-mrr">R$ 0,00</strong></div>
+        <button class="btn bp bsm" onclick="SP('restaurants');openNewRest()">＋ Restaurante</button>
+      </div>
+    </div>
+    <div class="content">
+
+      <!-- DASHBOARD -->
+      <div class="panel active" id="panel-dashboard">
+        <div class="sr" id="dash-stats"></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px">
+          <div class="card"><h3 style="font-size:.87rem;font-weight:700;margin-bottom:12px">🏪 Restaurantes Recentes</h3><div id="dash-rr"></div></div>
+          <div class="card"><h3 style="font-size:.87rem;font-weight:700;margin-bottom:12px">📈 Atividade</h3><div class="tl" id="dash-tl"></div></div>
+        </div>
+        <div class="card"><h3 style="font-size:.87rem;font-weight:700;margin-bottom:12px">📊 Por Plano</h3><div id="dash-pd" style="display:flex;gap:10px;flex-wrap:wrap"></div></div>
+      </div>
+
+      <!-- RESTAURANTS -->
+      <div class="panel" id="panel-restaurants">
+        <div class="sb2">
+          <input type="text" id="rs" placeholder="🔍 Buscar restaurante..." oninput="loadRestaurants()"/>
+          <select id="rf-s" onchange="loadRestaurants()"><option value="">Todos status</option><option value="active">Ativo</option><option value="trial">Trial</option><option value="suspended">Suspenso</option><option value="cancelled">Cancelado</option></select>
+          <select id="rf-p" onchange="loadRestaurants()"><option value="">Todos planos</option></select>
+          <button class="btn bp" onclick="openNewRest()">＋ Novo Restaurante</button>
+        </div>
+        <div class="tw"><table>
+          <thead><tr><th>Restaurante</th><th>Plano</th><th>Status</th><th>Vencimento</th><th>Comandas</th><th>Link</th><th>Ações</th></tr></thead>
+          <tbody id="rest-tb"></tbody>
+        </table></div>
+      </div>
+
+      <!-- PLANS -->
+      <div class="panel" id="panel-plans">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+          <div><h2 style="font-size:1rem;font-weight:700">Planos & Serviços</h2><p style="font-size:.8rem;color:var(--mu)">Gerencie os planos oferecidos</p></div>
+          <button class="btn bp" onclick="openPlanModal()">＋ Novo Plano</button>
+        </div>
+        <div class="pg" id="plans-grid"></div>
+      </div>
+
+      <!-- FINANCE -->
+      <div class="panel" id="panel-finance">
+        <div class="sr" id="fin-stats" style="grid-template-columns:repeat(3,1fr)"></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+          <div class="card"><h3 style="font-size:.87rem;font-weight:700;margin-bottom:11px">📋 Próximas Cobranças</h3><div id="fin-up"></div></div>
+          <div class="card"><h3 style="font-size:.87rem;font-weight:700;margin-bottom:11px">📅 Atividade Recente</h3><div class="tl" id="fin-tl"></div></div>
+        </div>
+      </div>
+
+      <!-- SETTINGS -->
+      <div class="panel" id="panel-settings">
+        <div style="max-width:480px;display:flex;flex-direction:column;gap:14px">
+          <div class="card">
+            <h3 style="font-size:.87rem;font-weight:700;margin-bottom:13px">🔐 Alterar Senha Master</h3>
+            <div class="fg"><label>Nova Senha</label><input type="password" id="sp1" placeholder="Mínimo 4 caracteres"/></div>
+            <div class="fg"><label>Confirmar</label><input type="password" id="sp2" placeholder="Repita a senha"/></div>
+            <button class="btn bp" onclick="changePass()">Salvar Senha</button>
+          </div>
+          <div class="card">
+            <h3 style="font-size:.87rem;font-weight:700;margin-bottom:13px">🏢 Sistema</h3>
+            <div class="fg"><label>Nome do Sistema</label><input type="text" id="sn" placeholder="PedidoSaaS"/></div>
+            <div class="fg"><label>Contato / Email</label><input type="text" id="sc" placeholder="seu@email.com"/></div>
+            <button class="btn bp" onclick="saveSettings()">Salvar</button>
+          </div>
+          <div class="card" style="border-color:#fee2e2">
+            <h3 style="font-size:.87rem;font-weight:700;margin-bottom:9px;color:#dc2626">⚠️ Zona de Perigo</h3>
+            <p style="font-size:.8rem;color:var(--mu);margin-bottom:11px">Exportar backup de todos os dados do sistema.</p>
+            <button class="btn bg" onclick="exportData()">📥 Exportar Backup JSON</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+</div>
+
+<!-- Detail Sheet -->
+<div class="ds" id="ds">
+  <div class="dsh">
+    <button class="dsc" onclick="closeDS()">✕</button>
+    <div style="flex:1"><div style="font-size:1.1rem;font-weight:800" id="ds-title"></div><div style="font-size:.78rem;color:var(--mu);margin-top:2px" id="ds-sub"></div></div>
+    <div id="ds-badge"></div>
+  </div>
+  <div class="dsb" id="ds-body"></div>
+  <div class="dsa" id="ds-actions"></div>
+</div>
+
+<!-- MODALS -->
+<div class="mo" id="mo-rest">
+  <div class="modal">
+    <div class="mh"><h3 id="mr-title">🏪 Novo Restaurante</h3><button class="mc" onclick="CM('mo-rest')">✕</button></div>
+    <div class="fr2">
+      <div class="fg"><label>Nome *</label><input type="text" id="r-name" placeholder="Nome do restaurante"/></div>
+      <div class="fg"><label>Responsável *</label><input type="text" id="r-owner" placeholder="Nome do dono"/></div>
+    </div>
+    <div class="fr2">
+      <div class="fg"><label>Telefone</label><input type="text" id="r-phone" placeholder="(11) 99999-9999"/></div>
+      <div class="fg"><label>Email</label><input type="email" id="r-email" placeholder="email@exemplo.com"/></div>
+    </div>
+    <div class="fg"><label>Endereço</label><input type="text" id="r-addr" placeholder="Rua, número, cidade"/></div>
+    <div class="fr2">
+      <div class="fg"><label>Plano *</label><select id="r-plan"></select></div>
+      <div class="fg"><label>Status</label>
+        <select id="r-status"><option value="trial">Trial</option><option value="active">Ativo</option><option value="suspended">Suspenso</option><option value="cancelled">Cancelado</option></select>
+      </div>
+    </div>
+    <div class="fr2">
+      <div class="fg"><label>Senha ADM do restaurante</label><input type="text" id="r-pass" placeholder="ex: 1234" value="1234"/></div>
+      <div class="fg"><label>Vencimento</label><input type="date" id="r-due"/></div>
+    </div>
+    <div class="fg"><label>Observações</label><textarea id="r-notes" placeholder="Notas internas..."></textarea></div>
+    <input type="hidden" id="r-id"/>
+    <div class="mf">
+      <button class="btn bg" onclick="CM('mo-rest')">Cancelar</button>
+      <button class="btn bp" onclick="saveRest()">💾 Salvar</button>
+    </div>
+  </div>
+</div>
+
+<div class="mo" id="mo-plan">
+  <div class="modal">
+    <div class="mh"><h3 id="mp-title">📦 Novo Plano</h3><button class="mc" onclick="CM('mo-plan')">✕</button></div>
+    <div class="fg"><label>Nome do Plano *</label><input type="text" id="p-name" placeholder="Ex: Básico, Pro, Enterprise"/></div>
+    <div class="fr2">
+      <div class="fg"><label>Valor Mensal (R$) *</label><input type="number" id="p-price" placeholder="0.00" step="0.01"/></div>
+      <div class="fg"><label>Tipo de Cobrança</label>
+        <select id="p-type"><option value="mensal">Mensal</option><option value="trimestral">Trimestral</option><option value="semestral">Semestral</option><option value="anual">Anual</option></select>
+      </div>
+    </div>
+    <div class="fg"><label>Descrição</label><textarea id="p-desc" placeholder="O que está incluído..."></textarea></div>
+    <div class="fg"><label>Recursos (um por linha)</label><textarea id="p-feat" placeholder="Sistema de comandas&#10;Até 5 usuários&#10;Suporte básico"></textarea></div>
+    <div class="fr2">
+      <div class="fg"><label>Máx. Usuários</label><input type="number" id="p-mu" placeholder="5"/></div>
+      <div class="fg"><label>Destaque</label><select id="p-feat2"><option value="no">Normal</option><option value="yes">⭐ Popular</option></select></div>
+    </div>
+    <div class="fr2">
+      <div class="fg"><label>Cor do Plano</label><input type="color" id="p-color" value="#6366f1" style="height:40px;padding:4px"/></div>
+    </div>
+    <input type="hidden" id="p-id"/>
+    <div class="mf">
+      <button class="btn bg" onclick="CM('mo-plan')">Cancelar</button>
+      <button class="btn bp" onclick="savePlan()">💾 Salvar Plano</button>
+    </div>
+  </div>
+</div>
+
+<div class="mo" id="mo-confirm">
+  <div class="modal" style="max-width:360px">
+    <div class="mh"><h3 id="cf-title">Confirmar</h3><button class="mc" onclick="CM('mo-confirm')">✕</button></div>
+    <p id="cf-msg" style="font-size:.88rem;color:var(--mu);margin-bottom:18px"></p>
+    <div class="mf"><button class="btn bg" onclick="CM('mo-confirm')">Cancelar</button><button class="btn bd" id="cf-btn">Confirmar</button></div>
+  </div>
+</div>
+
+<script>
+// ─── HELPERS ────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+function fmt(v){ return 'R$ '+Number(v||0).toFixed(2).replace('.',','); }
+function fmtd(d,s=false){ if(!d) return '—'; try{ return s?new Date(d).toLocaleDateString('pt-BR'):new Date(d).toLocaleString('pt-BR'); }catch{ return d; } }
+function toast(msg,t='s'){ const c=$('toast'); const el=document.createElement('div'); el.className='toast t'+t; el.textContent=msg; c.appendChild(el); setTimeout(()=>{el.style.opacity='0';el.style.transform='translateX(100%)';el.style.transition='all .3s';setTimeout(()=>el.remove(),300);},2800); }
+function OM(id){ $(id).classList.add('active'); }
+function CM(id){ $(id).classList.remove('active'); }
+document.querySelectorAll('.mo').forEach(o=>o.addEventListener('click',e=>{ if(e.target===o) o.classList.remove('active'); }));
+async function api(method,url,body){
+  const opts={method,headers:{'Content-Type':'application/json'},credentials:'include'};
+  if(body) opts.body=JSON.stringify(body);
+  const r=await fetch(url,opts); return r.json();
+}
+
+// ─── STATE ──────────────────────────────────────────────────
+let plans=[], restaurants=[], tl=[];
+
+// ─── INIT ────────────────────────────────────────────────────
+async function init(){
+  try {
+    await loadPlans();
+    await loadTimeline();
+    await renderDash();
+  } catch(e){ console.error('init error',e); }
+}
+
+async function loadPlans(){
+  try {
+    const d=await api('GET','/api/master/plans');
+    plans=d.plans||[];
+    buildPlanSelects();
+  } catch(e){ plans=[]; }
+}
+async function loadStats(){
+  try {
+    const d=await api('GET','/api/master/stats');
+    updateMrr(d.mrr||0);
+    return d;
+  } catch(e){ return {total:0,active:0,trial:0,suspended:0,cancelled:0,mrr:0}; }
+}
+async function loadTimeline(){
+  try {
+    const d=await api('GET','/api/master/timeline');
+    tl=d.timeline||[];
+  } catch(e){ tl=[]; }
+}
+
+function updateMrr(v){ $('tb-mrr').textContent=fmt(v); }
+function buildPlanSelects(){
+  const sel=$('r-plan'); if(!sel) return;
+  sel.innerHTML=plans.map(p=>`<option value="${p.id}">${p.name} — ${fmt(p.price)}/${p.type}</option>`).join('');
+  // filter
+  const fp=$('rf-p'); if(fp){ fp.innerHTML=`<option value="">Todos planos</option>`+plans.map(p=>`<option value="${p.id}">${p.name}</option>`).join(''); }
+}
+
+// ─── PANELS ─────────────────────────────────────────────────
+function SP(name,el){
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.ni').forEach(n=>n.classList.remove('active'));
+  $('panel-'+name).classList.add('active');
+  if(el) el.classList.add('active');
+  else{ const nb=document.querySelector(`[data-p="${name}"]`); if(nb) nb.classList.add('active'); }
+  const titles={dashboard:'Dashboard',restaurants:'Restaurantes',plans:'Planos & Preços',finance:'Financeiro',settings:'Configurações'};
+  $('tb-title').textContent=titles[name]||name;
+  if(name==='restaurants'){ buildPlanSelects(); loadRestaurants(); }
+  if(name==='plans') renderPlans();
+  if(name==='finance') renderFinance();
+}
+
+// ─── DASHBOARD ──────────────────────────────────────────────
+async function renderDash(){
+  const d=await loadStats();
+  const nbVal=(d.active||0)+(d.trial||0);
+  $('nb').textContent=nbVal;
+  $('dash-stats').innerHTML=`
+    <div class="sc"><span class="si">🏪</span><div class="sv">${d.total}</div><div class="sl">Total Restaurantes</div></div>
+    <div class="sc"><span class="si">✅</span><div class="sv" style="color:#16a34a">${d.active}</div><div class="sl">Ativos <span style="color:#6366f1;font-size:.75rem">${d.trial} trial</span></div></div>
+    <div class="sc"><span class="si">⚠️</span><div class="sv" style="color:#d97706">${d.suspended}</div><div class="sl">Suspensos</div></div>
+    <div class="sc"><span class="si">💰</span><div class="sv" style="color:#6366f1">${fmt(d.mrr)}</div><div class="sl">MRR Estimado</div></div>`;
+  updateMrr(d.mrr||0);
+  // Recent restaurants
+  const rd=await api('GET','/api/master/restaurants');
+  restaurants=rd.restaurants||[];
+  const rec=restaurants.slice(-5).reverse();
+  $('dash-rr').innerHTML=rec.length===0?'<p style="font-size:.83rem;color:#64748b">Nenhum restaurante.</p>':
+    rec.map(r=>`<div style="display:flex;align-items:center;gap:9px;padding:7px 0;border-bottom:1px solid #f8fafc;cursor:pointer" onclick="openDS('${r.id}')">
+      <div style="width:32px;height:32px;border-radius:7px;background:#eef2ff;display:flex;align-items:center;justify-content:center;font-size:.95rem;flex-shrink:0">🏪</div>
+      <div style="flex:1"><div style="font-size:.85rem;font-weight:600">${r.name}</div><div style="font-size:.72rem;color:#64748b">${r.planName}</div></div>
+      <span class="badge b${stc(r.status)}">${slb(r.status)}</span>
+    </div>`).join('');
+  // Timeline
+  await loadTimeline();
+  $('dash-tl').innerHTML=tl.slice(0,8).map(t=>`<div class="tli"><div class="tld" style="background:${t.color||'#6366f1'}"></div><div><div class="tlm">${t.msg}</div><div class="tlt">${fmtd(t.at,true)}</div></div></div>`).join('')||'<p style="font-size:.83rem;color:#64748b">Nenhuma atividade.</p>';
+  // Plan dist
+  const dist={};restaurants.forEach(r=>{ if(r.planName) dist[r.planName]=(dist[r.planName]||0)+1; });
+  $('dash-pd').innerHTML=Object.entries(dist).map(([k,v])=>`<div style="display:flex;align-items:center;gap:7px;padding:7px 12px;background:#f8fafc;border-radius:7px"><span style="font-size:.85rem;font-weight:700">${k}</span><span class="badge ba">${v} rest.</span></div>`).join('')||'<p style="font-size:.83rem;color:#64748b">Sem dados.</p>';
+}
+
+// ─── RESTAURANTS ─────────────────────────────────────────────
+async function loadRestaurants(){
+  const d=await api('GET','/api/master/restaurants');
+  restaurants=d.restaurants||[];
+  const q=($('rs').value||'').toLowerCase();
+  const fs=$('rf-s').value, fp=$('rf-p').value;
+  let list=restaurants;
+  if(q) list=list.filter(r=>r.name.toLowerCase().includes(q)||(r.owner||'').toLowerCase().includes(q));
+  if(fs) list=list.filter(r=>r.status===fs);
+  if(fp) list=list.filter(r=>r.planId===fp);
+  const tb=$('rest-tb');
+  if(list.length===0){ tb.innerHTML=`<tr><td colspan="7"><div class="empty"><span class="icon">🏪</span><p>Nenhum restaurante.</p></div></td></tr>`; return; }
+  const host=location.hostname; const port=location.port;
+  tb.innerHTML=list.map(r=>{
+    const url=`http://${host}:${port}/r/${r.id}`;
+    return `<tr>
+      <td><div style="font-weight:600">${r.name}</div><div style="font-size:.74rem;color:#64748b">${r.owner}</div></td>
+      <td><span class="badge bpl">${r.planName}</span></td>
+      <td><span class="badge b${stc(r.status)}">${slb(r.status)}</span></td>
+      <td style="font-size:.81rem">${fmtd(r.dueDate,true)}</td>
+      <td style="font-size:.81rem"><span style="font-weight:600;color:#6366f1">${r.openComandas}</span> abertas / ${r.totalComandas} total</td>
+      <td><a href="${url}" target="_blank" style="font-size:.78rem;color:#6366f1;font-weight:600;text-decoration:none">🔗 Abrir</a></td>
+      <td><div class="tda">
+        <button class="btn bg bsm" onclick="openDS('${r.id}')">👁</button>
+        <button class="btn bg bsm" onclick="editRest('${r.id}')">✏️</button>
+        <button class="btn bd bsm" onclick="confirmDel('${r.id}')">🗑</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+}
+
+function stc(s){ return {active:'a',trial:'tr',suspended:'su',cancelled:'ca'}[s]||'a'; }
+function slb(s){ return {active:'Ativo',trial:'Trial',suspended:'Suspenso',cancelled:'Cancelado'}[s]||s; }
+
+function openNewRest(){
+  $('r-name').value='';$('r-owner').value='';$('r-phone').value='';$('r-email').value='';
+  $('r-addr').value='';$('r-notes').value='';$('r-pass').value='1234';$('r-status').value='trial';
+  $('r-id').value='';
+  const due=new Date();due.setDate(due.getDate()+30);
+  $('r-due').value=due.toISOString().split('T')[0];
+  $('mr-title').textContent='🏪 Novo Restaurante';
+  buildPlanSelects();
+  if(plans.length>0) $('r-plan').value=plans[0].id;
+  OM('mo-rest');
+}
+async function editRest(id){
+  const r=restaurants.find(x=>x.id===id); if(!r) return;
+  buildPlanSelects();
+  $('r-name').value=r.name;$('r-owner').value=r.owner||'';$('r-phone').value=r.phone||'';
+  $('r-email').value=r.email||'';$('r-addr').value=r.address||'';$('r-notes').value=r.notes||'';
+  $('r-status').value=r.status;$('r-plan').value=r.planId||'';$('r-due').value=r.dueDate||'';
+  $('r-pass').value='';$('r-id').value=id;
+  $('mr-title').textContent='✏️ Editar Restaurante';
+  OM('mo-rest');
+}
+async function saveRest(){
+  const name=$('r-name').value.trim(), owner=$('r-owner').value.trim(), planId=$('r-plan').value;
+  if(!name){toast('Informe o nome','e');return;}
+  if(!owner){toast('Informe o responsável','e');return;}
+  const data={name,owner,phone:$('r-phone').value.trim(),email:$('r-email').value.trim(),
+    address:$('r-addr').value.trim(),notes:$('r-notes').value.trim(),
+    status:$('r-status').value,planId,dueDate:$('r-due').value,
+    adminPass:$('r-pass').value||'1234'};
+  const editId=$('r-id').value;
+  let res;
+  if(editId){ res=await api('POST',`/api/master/restaurants/${editId}`,data); }
+  else{ res=await api('POST','/api/master/restaurants',data); }
+  if(res.ok||res.id){ toast(editId?'Atualizado!':'Restaurante criado!'); CM('mo-rest'); await loadRestaurants(); await renderDash(); }
+  else toast(res.error||'Erro','e');
+}
+function confirmDel(id){
+  const r=restaurants.find(x=>x.id===id); if(!r) return;
+  $('cf-title').textContent='Excluir Restaurante';
+  $('cf-msg').textContent=`Excluir "${r.name}"? Todos os dados serão removidos permanentemente.`;
+  $('cf-btn').onclick=async()=>{ const res=await api('POST',`/api/master/restaurants/${id}/delete`,{}); if(res.ok){toast('Excluído!','i');CM('mo-confirm');closeDS();await loadRestaurants();await renderDash();}else toast(res.error,'e'); };
+  OM('mo-confirm');
+}
+
+// ─── DETAIL SHEET ───────────────────────────────────────────
+function openDS(id){
+  const r=restaurants.find(x=>x.id===id); if(!r) return;
+  const plan=plans.find(p=>p.id===r.planId);
+  const host=location.hostname, port=location.port;
+  const url=`http://${host}:${port}/r/${id}`;
+  $('ds-title').textContent=r.name;
+  $('ds-sub').textContent=(r.owner||'')+(r.email?' · '+r.email:'');
+  $('ds-badge').innerHTML=`<span class="badge b${stc(r.status)}">${slb(r.status)}</span>`;
+  $('ds-body').innerHTML=`
+    <div class="dss"><h4>Informações</h4>
+      <div class="dsr"><span class="dk">Responsável</span><span class="dv">${r.owner||'—'}</span></div>
+      <div class="dsr"><span class="dk">Telefone</span><span class="dv">${r.phone||'—'}</span></div>
+      <div class="dsr"><span class="dk">Email</span><span class="dv">${r.email||'—'}</span></div>
+      <div class="dsr"><span class="dk">Endereço</span><span class="dv">${r.address||'—'}</span></div>
+      <div class="dsr"><span class="dk">Cadastrado</span><span class="dv">${fmtd(r.createdAt,true)}</span></div>
+    </div>
+    <div class="dss"><h4>Assinatura</h4>
+      <div class="dsr"><span class="dk">Plano</span><span class="dv">${plan?plan.name:'—'}</span></div>
+      <div class="dsr"><span class="dk">Valor</span><span class="dv" style="color:#6366f1;font-size:1rem">${plan?fmt(plan.price)+'/'+plan.type:'—'}</span></div>
+      <div class="dsr"><span class="dk">Vencimento</span><span class="dv">${fmtd(r.dueDate,true)}</span></div>
+    </div>
+    <div class="dss"><h4>Acesso do Restaurante</h4>
+      <div style="background:#f8fafc;border-radius:8px;padding:11px;font-size:.82rem;word-break:break-all">
+        <strong>Link:</strong> <a href="${url}" target="_blank" style="color:#6366f1">${url}</a>
+      </div>
+      <p style="font-size:.76rem;color:#64748b;margin-top:7px">Senha ADM padrão: definida no cadastro</p>
+    </div>
+    ${r.notes?`<div class="dss"><h4>Notas</h4><p style="font-size:.83rem;color:#64748b;line-height:1.6">${r.notes}</p></div>`:''}
+    <div class="dss"><h4>Dados em Tempo Real</h4>
+      <div class="dsr"><span class="dk">Comandas Abertas</span><span class="dv" style="color:#16a34a">${r.openComandas}</span></div>
+      <div class="dsr"><span class="dk">Total de Comandas</span><span class="dv">${r.totalComandas}</span></div>
+    </div>`;
+  $('ds-actions').innerHTML=`
+    <button class="btn bg" style="width:100%;justify-content:flex-start" onclick="editRest('${id}');closeDS()">✏️ Editar Dados</button>
+    <a href="${url}" target="_blank" class="btn" style="background:#eef2ff;color:#6366f1;width:100%;justify-content:flex-start;text-decoration:none">🔗 Abrir Sistema do Restaurante</a>
+    ${r.status!=='active'?`<button class="btn bs" style="width:100%;justify-content:flex-start" onclick="chStatus('${id}','active')">✅ Ativar</button>`:''}
+    ${r.status==='active'?`<button class="btn bw" style="width:100%;justify-content:flex-start" onclick="chStatus('${id}','suspended')">⏸ Suspender</button>`:''}
+    ${r.status!=='cancelled'?`<button class="btn bd" style="width:100%;justify-content:flex-start" onclick="chStatus('${id}','cancelled')">❌ Cancelar Assinatura</button>`:''}
+    <button class="btn bg" style="width:100%;justify-content:flex-start" onclick="confirmDel('${id}')">🗑 Excluir Permanentemente</button>`;
+  $('ds').classList.add('open'); $('dsov').style.display='block'; $('dsov').classList.add('active');
+}
+function closeDS(){ $('ds').classList.remove('open'); $('dsov').style.display='none'; $('dsov').classList.remove('active'); }
+async function chStatus(id,status){
+  const res=await api('POST',`/api/master/restaurants/${id}/status`,{status});
+  if(res.ok){ toast('Status atualizado!'); await loadRestaurants(); openDS(id); await renderDash(); }
+  else toast(res.error||'Erro','e');
+}
+
+// ─── PLANS ──────────────────────────────────────────────────
+function renderPlans(){
+  const g=$('plans-grid'); if(!g) return;
+  if(plans.length===0){ g.innerHTML=`<div class="empty" style="grid-column:1/-1"><span class="icon">📦</span><p>Nenhum plano criado.</p></div>`; return; }
+  g.innerHTML=plans.map(p=>{
+    const using=restaurants.filter(r=>r.planId===p.id&&r.status==='active').length;
+    const feats=(p.features||[]);
+    return `<div class="pc ${p.featured==='yes'?'feat':''}">
+      ${p.featured==='yes'?'<div class="pba">⭐ Popular</div>':''}
+      <div class="pn" style="color:${p.color||'#6366f1'}">${p.name}</div>
+      <div style="font-size:.76rem;color:#64748b;margin-bottom:8px">${p.type.charAt(0).toUpperCase()+p.type.slice(1)}</div>
+      <div class="ppr" style="color:${p.color||'#6366f1'}">${fmt(p.price)}<span>/${p.type}</span></div>
+      <div class="pd">${p.desc||''}</div>
+      ${feats.length?'<ul style="font-size:.78rem;color:#64748b;padding-left:15px;margin-bottom:8px">'+feats.map(f=>`<li>${f}</li>`).join('')+'</ul>':''}
+      <div style="font-size:.76rem;color:#64748b;margin-bottom:10px">${using} ativo(s) · Máx ${p.maxUsers>=999?'∞':p.maxUsers} usuários</div>
+      <div style="display:flex;gap:6px">
+        <button class="btn bg bsm" onclick="editPlan('${p.id}')">✏️ Editar</button>
+        <button class="btn bd bsm" onclick="delPlan('${p.id}')">🗑</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+function openPlanModal(){
+  $('p-name').value='';$('p-price').value='';$('p-type').value='mensal';
+  $('p-desc').value='';$('p-feat').value='';$('p-mu').value='5';
+  $('p-feat2').value='no';$('p-color').value='#6366f1';$('p-id').value='';
+  $('mp-title').textContent='📦 Novo Plano'; OM('mo-plan');
+}
+function editPlan(id){
+  const p=plans.find(x=>x.id===id); if(!p) return;
+  $('p-name').value=p.name;$('p-price').value=p.price;$('p-type').value=p.type;
+  $('p-desc').value=p.desc||'';$('p-feat').value=(p.features||[]).join('\\n');
+  $('p-mu').value=p.maxUsers||5;$('p-feat2').value=p.featured||'no';
+  $('p-color').value=p.color||'#6366f1';$('p-id').value=id;
+  $('mp-title').textContent='✏️ Editar Plano'; OM('mo-plan');
+}
+async function savePlan(){
+  const name=$('p-name').value.trim(), price=parseFloat($('p-price').value);
+  if(!name){toast('Informe o nome','e');return;}
+  if(isNaN(price)||price<0){toast('Preço inválido','e');return;}
+  const data={name,price,type:$('p-type').value,desc:$('p-desc').value.trim(),
+    features:$('p-feat').value.split('\\n').map(f=>f.trim()).filter(Boolean),
+    maxUsers:parseInt($('p-mu').value)||5,featured:$('p-feat2').value,color:$('p-color').value};
+  const eid=$('p-id').value;
+  let res;
+  if(eid) res=await api('POST',`/api/master/plans/${eid}`,data);
+  else res=await api('POST','/api/master/plans',data);
+  if(res.ok){toast(eid?'Plano atualizado!':'Plano criado!');CM('mo-plan');await loadPlans();renderPlans();}
+  else toast(res.error||'Erro','e');
+}
+async function delPlan(id){
+  const p=plans.find(x=>x.id===id); if(!p) return;
+  const using=restaurants.filter(r=>r.planId===id).length;
+  if(using>0){toast(`${using} restaurante(s) usam este plano. Mude-os primeiro.`,'e');return;}
+  if(!confirm(`Excluir plano "${p.name}"?`)) return;
+  const res=await api('POST',`/api/master/plans/${id}/delete`,{});
+  if(res.ok){toast('Plano excluído!','i');await loadPlans();renderPlans();}
+}
+
+// ─── FINANCE ────────────────────────────────────────────────
+async function renderFinance(){
+  const d=await loadStats();
+  const active=restaurants.filter(r=>r.status==='active');
+  const mrr=active.reduce((s,r)=>{const p=plans.find(x=>x.id===r.planId);return s+(p?p.price:0);},0);
+  $('fin-stats').innerHTML=`
+    <div class="sc"><span class="si">💰</span><div class="sv" style="color:#6366f1">${fmt(mrr)}</div><div class="sl">MRR</div></div>
+    <div class="sc"><span class="si">📈</span><div class="sv" style="color:#16a34a">${fmt(mrr*12)}</div><div class="sl">ARR Estimado</div></div>
+    <div class="sc"><span class="si">⚠️</span><div class="sv" style="color:#d97706">${d.suspended}</div><div class="sl">Suspensos</div></div>`;
+  const up=restaurants.filter(r=>r.status==='active'&&r.dueDate).sort((a,b)=>new Date(a.dueDate)-new Date(b.dueDate)).slice(0,8);
+  $('fin-up').innerHTML=up.length===0?'<p style="font-size:.83rem;color:#64748b">Nenhuma cobrança próxima.</p>':
+    up.map(r=>{const p=plans.find(x=>x.id===r.planId);return`<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid #f8fafc">
+      <div><div style="font-size:.83rem;font-weight:600">${r.name}</div><div style="font-size:.72rem;color:#64748b">${fmtd(r.dueDate,true)}</div></div>
+      <span style="font-weight:700;color:#6366f1">${p?fmt(p.price):'—'}</span>
+    </div>`}).join('');
+  await loadTimeline();
+  $('fin-tl').innerHTML=tl.slice(0,10).map(t=>`<div class="tli"><div class="tld" style="background:${t.color||'#6366f1'}"></div><div><div class="tlm">${t.msg}</div><div class="tlt">${fmtd(t.at,true)}</div></div></div>`).join('')||'<p style="font-size:.83rem;color:#64748b">Nenhum histórico.</p>';
+}
+
+// ─── SETTINGS ───────────────────────────────────────────────
+async function changePass(){
+  const p=$('sp1').value, p2=$('sp2').value;
+  if(!p||p.length<4){toast('Mínimo 4 caracteres','e');return;}
+  if(p!==p2){toast('Senhas não conferem','e');return;}
+  const res=await api('POST','/api/master/settings',{newPassword:p});
+  if(res.ok){toast('Senha alterada!');$('sp1').value='';$('sp2').value='';}
+  else toast(res.error||'Erro','e');
+}
+async function saveSettings(){
+  const res=await api('POST','/api/master/settings',{settings:{sysName:$('sn').value.trim(),contact:$('sc').value.trim()}});
+  if(res.ok) toast('Configurações salvas!');
+  else toast(res.error||'Erro','e');
+}
+async function exportData(){
+  const d=await api('GET','/api/master/restaurants');
+  const p=await api('GET','/api/master/plans');
+  const t=await api('GET','/api/master/timeline');
+  const blob=new Blob([JSON.stringify({restaurants:d.restaurants,plans:p.plans,timeline:t.timeline},null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`backup_${new Date().toLocaleDateString('pt-BR').replace(/[/]/g,'-')}.json`;a.click();
+  toast('Backup exportado!');
+}
+async function logout(){
+  await api('POST','/api/master/logout',{});
+  location.reload();
+}
+
+// ─── START ──────────────────────────────────────────────────
+init();
+</script></body></html>"""
+
+
+def render_restaurant_login(rest, rid):
+    name = rest.get("name", "Restaurante")
+    color = "#2563eb"
+    try:
+        cfg = load_json(rest_file(rid, "config"), {})
+        color = cfg.get("color", "#2563eb")
+    except: pass
+    users = load_json(rest_file(rid, "users"), [])
+    users_json = json.dumps([{"id": u["id"], "name": u["name"], "role": u.get("role","garcom")} for u in users])
+    return f"""<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>{name} — Login</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,{color} 0%,{color}cc 100%);padding:20px}}
+.card{{background:#fff;border-radius:20px;padding:26px 22px;width:100%;max-width:400px;box-shadow:0 12px 40px rgba(0,0,0,.3)}}
+h1{{font-size:1.3rem;font-weight:800;margin-bottom:4px;color:#0f172a}}
+.sub{{font-size:.82rem;color:#64748b;margin-bottom:18px}}
+.ul{{display:flex;flex-direction:column;gap:8px;margin-bottom:16px;max-height:240px;overflow-y:auto}}
+.ub{{display:flex;align-items:center;gap:11px;padding:12px 14px;border-radius:8px;border:2px solid #e2e8f0;background:#fff;cursor:pointer;text-align:left;transition:all .2s}}
+.ub:hover,.ub.sel{{border-color:{color};background:{color}18}}
+.av{{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1rem;font-weight:700;flex-shrink:0;background:{color}22;color:{color}}}
+.ui strong{{display:block;font-size:.9rem;color:#0f172a}}.ui span{{font-size:.73rem;color:#64748b}}
+.pw{{display:none;flex-direction:column;gap:10px}}
+.pw label{{font-size:.8rem;font-weight:600;color:#64748b}}
+.pw input{{width:100%;padding:12px 14px;border:2px solid #e2e8f0;border-radius:8px;font-size:.95rem;font-family:inherit;transition:border .2s}}
+.pw input:focus{{outline:none;border-color:{color}}}
+.btn-l{{width:100%;padding:13px;border-radius:8px;font-size:.95rem;font-weight:700;color:#fff;border:none;cursor:pointer;margin-top:10px;transition:opacity .2s;background:{color}}}
+.btn-l:hover{{opacity:.9}}
+.err{{background:#fee2e2;color:#dc2626;padding:9px 13px;border-radius:7px;font-size:.83rem;margin-bottom:12px;display:none}}
+</style></head><body>
+<div class="card">
+  <h1>🍽️ {name}</h1>
+  <p class="sub">Selecione seu usuário para entrar</p>
+  <div id="err" class="err"></div>
+  <div class="ul" id="ul"></div>
+  <div class="pw" id="pw">
+    <label>Senha</label>
+    <input type="password" id="pass" placeholder="Digite sua senha" onkeydown="if(event.key==='Enter')login()"/>
+    <button class="btn-l" onclick="login()">Entrar 🔑</button>
+  </div>
+</div>
+<script>
+const USERS={users_json};
+const RID='{rid}';
+let selId=null;
+function render(){{
+  const ul=document.getElementById('ul');
+  ul.innerHTML=USERS.map(u=>`
+    <button class="ub" id="ub_${{u.id}}" onclick="sel('${{u.id}}')">
+      <div class="av">${{u.name[0]}}</div>
+      <div class="ui"><strong>${{u.name}}</strong><span>${{u.role==='admin'?'👑 Admin':u.role==='caixa'?'💰 Caixa':'🍽️ Garçom'}}</span></div>
+    </button>`).join('');
+}}
+function sel(id){{
+  selId=id;
+  document.querySelectorAll('.ub').forEach(b=>b.classList.remove('sel'));
+  document.getElementById('ub_'+id).classList.add('sel');
+  document.getElementById('pw').style.display='flex';
+  document.getElementById('pass').value='';
+  setTimeout(()=>document.getElementById('pass').focus(),100);
+}}
+async function login(){{
+  if(!selId){{showErr('Selecione um usuário');return;}}
+  const pass=document.getElementById('pass').value;
+  const r=await fetch(`/api/rest/${{RID}}/login`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{userId:selId,password:pass}}),credentials:'include'}});
+  const d=await r.json();
+  if(d.ok){{ sessionStorage.setItem('cu_'+RID, JSON.stringify(d.user)); window.location.replace('/r/'+RID); }}
+  else showErr(d.error||'Senha incorreta');
+}}
+function showErr(msg){{const e=document.getElementById('err');e.textContent=msg;e.style.display='block';}}
+render();
+</script></body></html>"""
+
+
+def render_restaurant_app(rest, rid):
+    """Serve the full restaurant app with server-sync"""
+    name = rest.get("name", "Restaurante")
+    # Load config for theme
+    cfg = load_json(rest_file(rid, "config"), {})
+    color = cfg.get("color", "#2563eb")
+    # Inject rid into the app HTML
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "app.html"), "r", encoding="utf-8") as f:
+        html = f.read()
+    html = html.replace("__RID__", rid).replace("__COLOR__", color).replace("__NAME__", name)
+    return html
+
+
+def render_suspended(rest):
+    name = rest.get("name","Restaurante")
+    status = rest.get("status","suspended")
+    msg = "Assinatura suspensa" if status=="suspended" else "Assinatura cancelada"
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{name}</title><style>body{{font-family:system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f8fafc;padding:20px}}
+.box{{background:#fff;border-radius:16px;padding:40px;text-align:center;max-width:400px;box-shadow:0 4px 20px rgba(0,0,0,.1)}}
+h1{{font-size:1.4rem;font-weight:800;margin-bottom:10px;color:#0f172a}}.msg{{color:#64748b;font-size:.9rem;line-height:1.6}}</style></head>
+<body><div class="box"><div style="font-size:3rem;margin-bottom:14px">🔒</div><h1>{name}</h1>
+<p class="msg">{msg}.<br/>Entre em contato com o suporte para reativar.</p></div></body></html>"""
+
+
+# ─── SERVER START ─────────────────────────────────────────────
+def start_server():
+    init_data()
+
+    # Check if app.html exists
+    app_html = os.path.join(STATIC_DIR, "app.html")
+    if not os.path.exists(app_html):
+        print("⚠️  AVISO: static/app.html não encontrado.")
+        print("   Copie o arquivo comanda-universal-server.html para static/app.html")
+
+    print("=" * 60)
+    print("  🍽️  SISTEMA DE COMANDAS — SERVIDOR LOCAL")
+    print("=" * 60)
+    print(f"\n  ✅  Servidor iniciado na porta {PORT}")
+    print(f"\n  🔗  Painel Master:  http://localhost:{PORT}/")
+    print(f"  🔗  Na rede local:  http://SEU_IP:{PORT}/")
+    print(f"\n  👤  Login Master:   admin / admin123")
+    print(f"\n  ⚠️  Para parar: feche esta janela ou Ctrl+C")
+    print("=" * 60)
+
+    # Try to detect local IP
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        print(f"\n  📱  Celulares: http://{ip}:{PORT}/r/[id-restaurante]")
+    except: pass
+
+    print()
+
+    socketserver.TCPServer.allow_reuse_address = True
+    socketserver.TCPServer.request_queue_size = 20
+    import threading
+    class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True
+    with ThreadedTCPServer(("", PORT), Handler) as httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n\n  👋  Servidor encerrado.")
+
+
+if __name__ == "__main__":
+    start_server()
